@@ -2,7 +2,7 @@ id: EdgeTTSFix
 name: EdgeTTSFix
 description: 使 ClassIsland 的语音服务接入 Edge TTS（支持 Sec-MS-GEC v2 令牌）
 entranceAssembly: "EdgeTTSFix.dll"
-version: 1.0.1.0
+version: 1.0.2.0
 apiVersion: 2.0.0.0
 author: lladlam
 icon: Icon.ico

@@ -16,13 +16,9 @@ public sealed class EdgeTtsClient
     private const string SecMsGecVersionV2 = "2-" + ChromiumVersion;
     private const string SecMsGecVersionV1 = "1-143.0.3650.75";
     private const string OutputFormat = "audio-24khz-48kbitrate-mono-mp3";
-    private const int AttemptTimeoutSeconds = 30;
 
-    private static readonly Uri V2Endpoint =
+    private static readonly Uri SpeechEndpoint =
         new("wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1");
-
-    private static readonly Uri LegacyEndpoint =
-        new("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1");
 
     private static readonly string UserAgent =
         $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -57,56 +53,109 @@ public sealed class EdgeTtsClient
 
         var attempts = new[]
         {
-            (Endpoint: V2Endpoint, UseV2Token: true, Version: SecMsGecVersionV2, Name: "v2"),
-            (Endpoint: V2Endpoint, UseV2Token: false, Version: SecMsGecVersionV1, Name: "v1-token"),
-            (Endpoint: LegacyEndpoint, UseV2Token: false, Version: SecMsGecVersionV1, Name: "legacy-host")
+            (UseV2Token: true, WindowOffsetMinutes: 0, Version: SecMsGecVersionV2, Name: "v2"),
+            (UseV2Token: true, WindowOffsetMinutes: -5, Version: SecMsGecVersionV2, Name: "v2-prev-window"),
+            (UseV2Token: false, WindowOffsetMinutes: 0, Version: SecMsGecVersionV1, Name: "v1-token"),
+            (UseV2Token: false, WindowOffsetMinutes: -5, Version: SecMsGecVersionV1, Name: "v1-token-prev-window")
         };
 
         Exception? lastError = null;
+        var lastKind = EdgeTtsErrorKind.Unknown;
+        var timeout = GetAttemptTimeout(text);
+
         foreach (var attempt in attempts)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var temporaryPath = string.Concat(
-                destinationPath, ".", Guid.NewGuid().ToString("N"), ".tmp");
-            try
+            // 连接失败通常是瞬时的，同一组合额外重试一次。
+            for (var retry = 0; retry < 2; retry++)
             {
-                await SynthesizeOnceAsync(
-                    attempt.Endpoint,
-                    attempt.UseV2Token,
-                    attempt.Version,
-                    text,
-                    options,
-                    temporaryPath,
-                    cancellationToken);
+                var temporaryPath = string.Concat(
+                    destinationPath, ".", Guid.NewGuid().ToString("N"), ".tmp");
+                try
+                {
+                    _logger.LogDebug(
+                        "Edge TTS 尝试 {Attempt}（{Length} 字，超时 {Timeout:F0}s）",
+                        attempt.Name, text.Length, timeout.TotalSeconds);
 
-                File.Move(temporaryPath, destinationPath, true);
-                return;
-            }
-            catch (OperationCanceledException)
-            {
-                TryDelete(temporaryPath);
-                throw;
-            }
-            catch (Exception ex) when (IsHandshakeRejection(ex))
-            {
-                TryDelete(temporaryPath);
-                lastError = ex;
-                _logger.LogWarning(ex, "Edge TTS 端点 {Attempt} 握手被拒绝，尝试下一个端点。", attempt.Name);
-            }
-            catch (Exception ex)
-            {
-                TryDelete(temporaryPath);
-                throw new EdgeTtsException($"Edge TTS 合成失败：{ex.Message}", ex);
+                    await SynthesizeOnceAsync(
+                        SpeechEndpoint,
+                        attempt.UseV2Token,
+                        attempt.WindowOffsetMinutes,
+                        attempt.Version,
+                        text,
+                        options,
+                        temporaryPath,
+                        cancellationToken);
+
+                    File.Move(temporaryPath, destinationPath, true);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    TryDelete(temporaryPath);
+                    throw;
+                }
+                catch (EdgeTtsException ex) when (ex.Kind == EdgeTtsErrorKind.NoAudio)
+                {
+                    TryDelete(temporaryPath);
+                    lastError = ex;
+                    lastKind = ex.Kind;
+                    _logger.LogWarning(ex, "Edge TTS 尝试 {Attempt} 未返回音频，尝试下一个组合。", attempt.Name);
+                    break;
+                }
+                catch (Exception ex) when (IsHandshakeRejection(ex))
+                {
+                    TryDelete(temporaryPath);
+                    lastError = ex;
+                    lastKind = EdgeTtsErrorKind.Handshake;
+                    _logger.LogWarning(ex, "Edge TTS 尝试 {Attempt} 握手被拒绝，尝试下一个组合。", attempt.Name);
+                    break;
+                }
+                catch (Exception ex) when (IsConnectionFailure(ex))
+                {
+                    TryDelete(temporaryPath);
+                    lastError = ex;
+                    lastKind = EdgeTtsErrorKind.Connection;
+                    if (retry == 0)
+                    {
+                        _logger.LogWarning(ex, "Edge TTS 尝试 {Attempt} 连接失败，稍后重试。", attempt.Name);
+                        await Task.Delay(TimeSpan.FromMilliseconds(800), cancellationToken);
+                        continue;
+                    }
+
+                    _logger.LogWarning(ex, "Edge TTS 尝试 {Attempt} 连接失败，尝试下一个组合。", attempt.Name);
+                    break;
+                }
+                catch (EdgeTtsException ex)
+                {
+                    TryDelete(temporaryPath);
+                    lastError = ex;
+                    lastKind = ex.Kind;
+                    _logger.LogWarning(ex, "Edge TTS 尝试 {Attempt} 失败（{Kind}）。", attempt.Name, ex.Kind);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    TryDelete(temporaryPath);
+                    throw new EdgeTtsException(
+                        $"Edge TTS 合成失败：{ex.Message}",
+                        EdgeTtsErrorKind.Unknown,
+                        ex);
+                }
             }
         }
 
-        throw new EdgeTtsException("Edge TTS 所有端点均拒绝连接。", lastError);
+        throw new EdgeTtsException(
+            $"Edge TTS 所有端点均失败：{lastError?.Message}",
+            lastKind,
+            lastError);
     }
 
     private async Task SynthesizeOnceAsync(
         Uri endpoint,
         bool useV2Token,
+        int windowOffsetMinutes,
         string version,
         string text,
         EdgeTtsOptions options,
@@ -114,13 +163,13 @@ public sealed class EdgeTtsClient
         CancellationToken cancellationToken)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(AttemptTimeoutSeconds));
+        timeoutCts.CancelAfter(GetAttemptTimeout(text));
         var token = timeoutCts.Token;
 
         using var socket = new ClientWebSocket();
         ConfigureHeaders(socket);
 
-        var now = DateTimeOffset.UtcNow;
+        var now = DateTimeOffset.UtcNow.AddMinutes(windowOffsetMinutes);
         var secMsGec = useV2Token
             ? EdgeTtsTokenGenerator.GenerateV2(now)
             : EdgeTtsTokenGenerator.GenerateV1(now);
@@ -158,7 +207,7 @@ public sealed class EdgeTtsClient
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new EdgeTtsException("Edge TTS 请求超时。");
+            throw new EdgeTtsException("Edge TTS 请求超时。", EdgeTtsErrorKind.Timeout);
         }
     }
 
@@ -193,8 +242,9 @@ public sealed class EdgeTtsClient
                 result = await socket.ReceiveAsync(buffer.AsMemory(), token);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    throw new WebSocketException(
-                        $"服务端提前关闭连接：{socket.CloseStatus} {socket.CloseStatusDescription}");
+                    throw new EdgeTtsException(
+                        $"服务端提前关闭连接：{socket.CloseStatus} {socket.CloseStatusDescription}",
+                        EdgeTtsErrorKind.NoAudio);
                 }
 
                 message.Write(buffer, 0, result.Count);
@@ -233,7 +283,7 @@ public sealed class EdgeTtsClient
 
         if (audio.Length == 0)
         {
-            throw new EdgeTtsException("Edge TTS 未返回音频数据。");
+            throw new EdgeTtsException("Edge TTS 未返回音频数据。", EdgeTtsErrorKind.NoAudio);
         }
 
         await File.WriteAllBytesAsync(temporaryPath, audio.ToArray(), token);
@@ -345,15 +395,45 @@ public sealed class EdgeTtsClient
 
             if (current.Message.Contains("403", StringComparison.Ordinal) ||
                 current.Message.Contains("401", StringComparison.Ordinal) ||
-                current.Message.Contains("200", StringComparison.Ordinal) ||
+                current.Message.Contains("429", StringComparison.Ordinal) ||
+                current.Message.Contains("500", StringComparison.Ordinal) ||
                 current.Message.Contains("502", StringComparison.Ordinal) ||
-                current.Message.Contains("503", StringComparison.Ordinal))
+                current.Message.Contains("503", StringComparison.Ordinal) ||
+                current.Message.Contains("status code '200'", StringComparison.Ordinal))
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static bool IsConnectionFailure(Exception exception)
+    {
+        for (Exception? current = exception; current != null; current = current.InnerException)
+        {
+            if (current is HttpRequestException or System.Net.Sockets.SocketException)
+            {
+                return true;
+            }
+
+            if (current is WebSocketException &&
+                (current.Message.Contains("Unable to connect", StringComparison.OrdinalIgnoreCase) ||
+                 current.Message.Contains("remote server", StringComparison.OrdinalIgnoreCase) ||
+                 current.Message.Contains("connection", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static TimeSpan GetAttemptTimeout(string text)
+    {
+        // 长文本需要更长的生成时间；短文本保持快速失败。
+        var seconds = Math.Clamp(30 + text.Length * 0.01, 30, 300);
+        return TimeSpan.FromSeconds(seconds);
     }
 
     private static void TryDelete(string path)
@@ -372,13 +452,25 @@ public sealed class EdgeTtsClient
     }
 }
 
+public enum EdgeTtsErrorKind
+{
+    Unknown,
+    Handshake,
+    NoAudio,
+    Timeout,
+    Connection
+}
+
 public sealed class EdgeTtsException : Exception
 {
-    public EdgeTtsException(string message) : base(message)
+    public EdgeTtsException(
+        string message,
+        EdgeTtsErrorKind kind = EdgeTtsErrorKind.Unknown,
+        Exception? innerException = null)
+        : base(message, innerException)
     {
+        Kind = kind;
     }
 
-    public EdgeTtsException(string message, Exception? innerException) : base(message, innerException)
-    {
-    }
+    public EdgeTtsErrorKind Kind { get; }
 }

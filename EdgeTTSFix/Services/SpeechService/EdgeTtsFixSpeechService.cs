@@ -218,6 +218,15 @@ public class EdgeTtsFixSpeechService : ISpeechService
             _logger.LogInformation("Edge TTS 请求已取消。");
             return false;
         }
+        catch (EdgeTtsException ex)
+        {
+            _logger.LogError(
+                ex,
+                "Edge TTS 语音生成失败（{Kind}），文本长度 {Length}。",
+                ex.Kind,
+                text.Length);
+            return false;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Edge TTS 语音生成失败。");
